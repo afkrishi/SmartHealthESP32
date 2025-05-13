@@ -44,8 +44,8 @@
 #define WIFI_PASSWORD "wifi password"
 
 // Firebase configuration
-#define DATABASE_URL "https://healthsync-c0fab-default-rtdb.asia-southeast1.firebasedatabase.app/"
-#define DATABASE_SECRET "p6rpEh3EtDLOkpqO5mrRn1pE9NYn8Nek9r7Hl1Rc"
+#define DATABASE_URL "firebase link"
+#define DATABASE_SECRET "key"
 
 // Sensor pins
 const int pulsePin = 34;
@@ -55,6 +55,7 @@ const int zPin = 35;
 const int tempPin = 32;
 
 // Demo GPS location (Indore, MP)
+// Remove after integration 
 const double DEMO_LAT = 22.7196;
 const double DEMO_LNG = 75.8577;
 
