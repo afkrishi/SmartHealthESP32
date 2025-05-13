@@ -1,0 +1,331 @@
+// gps code for integration 
+//add only after working of below code
+//#include <TinyGPSPlus.h>
+
+//TinyGPSPlus gps;
+
+// Use Serial2 (UART2) on ESP32 for GPS
+//#define RXD2 16  // Connect to GPS TX
+//#define TXD2 17  // Connect to GPS RX
+
+//void setup() {
+  // Serial.begin(115200);       // Serial monitor
+  // Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);  // GPS baud rate and pins
+ // Serial.println("GPS Module Test - ESP32");
+// }
+
+// void loop() {
+//  while (Serial2.available() > 0) {
+//    gps.encode(Serial2.read());
+
+//    if (gps.location.isUpdated()) {
+//      Serial.print("Latitude: ");
+//      Serial.println(gps.location.lat(), 6);
+
+//      Serial.print("Longitude: ");
+//      Serial.println(gps.location.lng(), 6);
+
+//      Serial.println("--------------------");
+//    }
+//  }
+// }
+
+
+
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <math.h>
+#include <time.h>
+
+// WiFi credentials
+#define WIFI_SSID "wifi name"
+#define WIFI_PASSWORD "wifi password"
+
+// Firebase configuration
+#define DATABASE_URL "https://healthsync-c0fab-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DATABASE_SECRET "p6rpEh3EtDLOkpqO5mrRn1pE9NYn8Nek9r7Hl1Rc"
+
+// Sensor pins
+const int pulsePin = 34;
+const int gpsRxPin = 16;
+const int gpsTxPin = 17;
+const int zPin = 35;
+const int tempPin = 32;
+
+// Demo GPS location (Indore, MP)
+const double DEMO_LAT = 22.7196;
+const double DEMO_LNG = 75.8577;
+
+// Firebase and GPS objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+TinyGPSPlus gps;
+HardwareSerial SerialGPS(1);
+
+// Sensor data tracking
+int stepCount = 0;
+bool newGPSData = false;
+unsigned long lastFirebaseUpdate = 0;
+const unsigned long firebaseUpdateInterval = 5000;
+const unsigned long historicalDataInterval = 60000; // Store historical data every minute
+
+// Step debounce
+unsigned long lastStepTime = 0;
+const unsigned long stepCooldown = 300;
+
+// NTP server for accurate time when GPS is not available
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800; // GMT+5:30 (India)
+const int daylightOffset_sec = 0;
+
+void setup() {
+  Serial.begin(115200);
+  SerialGPS.begin(9600, SERIAL_8N1, gpsRxPin, gpsTxPin);
+
+  pinMode(pulsePin, INPUT);
+  pinMode(zPin, INPUT);
+  pinMode(tempPin, INPUT);
+
+  // Connect to WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("Connected to WiFi");
+  Serial.println(WiFi.localIP());
+
+  // Initialize NTP for time synchronization
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  // Firebase setup
+  config.database_url = DATABASE_URL;
+  config.signer.tokens.legacy_token = DATABASE_SECRET;
+
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&config, &auth);
+}
+
+// Function to get current timestamp in ISO8601 format
+String getISOTimestamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return "1970-01-01T00:00:00Z";
+  }
+  
+  char timeString[25];
+  strftime(timeString, sizeof(timeString), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  return String(timeString);
+}
+
+// Function to get current date in YYYY-MM-DD format
+String getCurrentDate() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain date");
+    return "1970-01-01";
+  }
+  
+  char dateString[11];
+  strftime(dateString, sizeof(dateString), "%Y-%m-%d", &timeinfo);
+  return String(dateString);
+}
+
+// Function to get current time in HH:MM:SS format
+String getCurrentTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return "00:00:00";
+  }
+  
+  char timeString[9];
+  strftime(timeString, sizeof(timeString), "%H:%M:%S", &timeinfo);
+  return String(timeString);
+}
+
+// Function to estimate blood pressure based on pulse and temperature
+void estimateBloodPressure(int pulse, float temp, int& systolic, int& diastolic) {
+  systolic = map(pulse, 60, 120, 110, 140);
+  diastolic = map(pulse, 60, 120, 70, 90);
+  
+  if (temp > 37.5) {
+    systolic += 5;
+    diastolic += 3;
+  } else if (temp < 36.0) {
+    systolic -= 3;
+    diastolic -= 2;
+  }
+}
+
+// Function to estimate SpO2 based on pulse and temperature
+int estimateSpO2(int pulse, float temp) {
+  int spo2 = 95;
+  if (pulse > 100) spo2 -= 2;
+  if (pulse > 120) spo2 -= 3;
+  if (pulse < 60) spo2 -= 1;
+  if (temp > 38.0) spo2 -= 2;
+  return constrain(spo2, 85, 100);
+}
+
+void storeHistoricalData(float temp, int pulse, int steps, int systolic, int diastolic, int spo2, float lat, float lng) {
+  String timestamp = getISOTimestamp();
+  String datePath = "historical/" + getCurrentDate() + "/" + timestamp;
+
+  FirebaseJson historicalJson;
+  historicalJson.set("temperature", temp);
+  historicalJson.set("pulse", pulse);
+  historicalJson.set("steps", steps);
+  historicalJson.set("systolic_bp", systolic);
+  historicalJson.set("diastolic_bp", diastolic);
+  historicalJson.set("spo2", spo2);
+  historicalJson.set("location/latitude", lat);
+  historicalJson.set("location/longitude", lng);
+  historicalJson.set("timestamp", timestamp);
+
+  if (Firebase.RTDB.setJSON(&fbdo, datePath.c_str(), &historicalJson)) {
+    Serial.println("Historical data stored successfully");
+  } else {
+    Serial.print("Failed to store historical data: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void loop() {
+  // === GPS Processing ===
+  while (SerialGPS.available()) {
+    if (gps.encode(SerialGPS.read())) {
+      newGPSData = true;
+    }
+  }
+
+  bool gpsValid = false;
+  if (millis() > 5000 && gps.charsProcessed() < 10) {
+    Serial.println("Warning: No GPS detected - Using demo location");
+  } else {
+    gpsValid = gps.location.isValid();
+  }
+
+  // === Step Detection with Debounce ===
+  int zValue = analogRead(zPin);
+  if (zValue > 2000 && millis() - lastStepTime > stepCooldown) {
+    stepCount++;
+    lastStepTime = millis();
+  }
+
+  // === Pulse Reading with Filtering ===
+  int pulseValue = analogRead(pulsePin);
+  pulseValue = constrain(pulseValue, 300, 3800);
+  int pulseBPM = map(pulseValue, 300, 3800, 60, 120);
+  pulseBPM = constrain(pulseBPM, 50, 130);
+
+  // === Temperature Reading with Safety Check ===
+  float temperatureC = 36.5;
+  int tempRaw = analogRead(tempPin);
+  if (tempRaw > 100) {
+    float voltage = tempRaw * (3.3 / 4095.0);
+    float seriesResistor = 10000.0;
+    float resistance = seriesResistor / ((4095.0 / tempRaw) - 1);
+    float steinhart = resistance / 10000.0;
+    steinhart = log(steinhart);
+    steinhart = 1.0 / (0.001129148 + (0.000234125 * steinhart) + (0.0000000876741 * pow(steinhart, 3)));
+    temperatureC = steinhart - 273.15;
+
+    if (temperatureC < 30 || temperatureC > 45) {
+      temperatureC = 36.5;
+    }
+  }
+
+  // === Health Parameter Estimation ===
+  int systolicBP, diastolicBP;
+  estimateBloodPressure(pulseBPM, temperatureC, systolicBP, diastolicBP);
+  int spo2 = estimateSpO2(pulseBPM, temperatureC);
+
+  // Get current location (use GPS if available, otherwise use demo location)
+  float currentLat = gpsValid ? gps.location.lat() : DEMO_LAT;
+  float currentLng = gpsValid ? gps.location.lng() : DEMO_LNG;
+
+  // === Firebase Update ===
+  if (millis() - lastFirebaseUpdate >= firebaseUpdateInterval) {
+    lastFirebaseUpdate = millis();
+
+    // Update real-time data
+    FirebaseJson realtimeJson;
+    realtimeJson.set("realtime/pulse", pulseBPM);
+    realtimeJson.set("realtime/steps", stepCount);
+    realtimeJson.set("realtime/temperature", temperatureC);
+    realtimeJson.set("realtime/z_axis", zValue);
+    
+    realtimeJson.set("realtime/health/systolic_bp", systolicBP);
+    realtimeJson.set("realtime/health/diastolic_bp", diastolicBP);
+    realtimeJson.set("realtime/health/spo2", spo2);
+    
+    realtimeJson.set("realtime/timestamp/time", getCurrentTime());
+    realtimeJson.set("realtime/timestamp/date", getCurrentDate());
+    realtimeJson.set("realtime/timestamp/iso", getISOTimestamp());
+
+    if (gpsValid) {
+      realtimeJson.set("realtime/gps/latitude", currentLat);
+      realtimeJson.set("realtime/gps/longitude", currentLng);
+      realtimeJson.set("realtime/gps/speed", gps.speed.kmph());
+      realtimeJson.set("realtime/gps/altitude", gps.altitude.meters());
+      realtimeJson.set("realtime/gps/status", "valid");
+    } else {
+      realtimeJson.set("realtime/gps/latitude", currentLat);
+      realtimeJson.set("realtime/gps/longitude", currentLng);
+      realtimeJson.set("realtime/gps/speed", 0);
+      realtimeJson.set("realtime/gps/altitude", 0);
+      realtimeJson.set("realtime/gps/status", "demo_location");
+    }
+
+    if (Firebase.RTDB.updateNode(&fbdo, "/healthsync", &realtimeJson)) {
+      Serial.println("Realtime Firebase update successful");
+    } else {
+      Serial.print("Realtime Firebase error: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    // Store historical data at longer intervals
+    static unsigned long lastHistoricalUpdate = 0;
+    if (millis() - lastHistoricalUpdate >= historicalDataInterval) {
+      lastHistoricalUpdate = millis();
+      storeHistoricalData(temperatureC, pulseBPM, stepCount, systolicBP, diastolicBP, spo2, currentLat, currentLng);
+    }
+  }
+
+  // === Serial Debug Output ===
+  Serial.println("\n=== Sensor Readings ===");
+  Serial.print("Steps: "); Serial.println(stepCount);
+  Serial.print("Pulse (BPM): "); Serial.println(pulseBPM);
+  Serial.print("Temp C: "); Serial.println(temperatureC, 2);
+  Serial.print("Z-Axis: "); Serial.println(zValue);
+  
+  Serial.println("\n=== Health Estimates ===");
+  Serial.print("Blood Pressure: "); Serial.print(systolicBP); Serial.print("/"); Serial.println(diastolicBP);
+  Serial.print("SpO2: "); Serial.print(spo2); Serial.println("%");
+
+  Serial.println("\n=== GPS Data ===");
+  if (gpsValid) {
+    Serial.print("Lat: "); Serial.println(currentLat, 6);
+    Serial.print("Lng: "); Serial.println(currentLng, 6);
+    Serial.print("Speed: "); Serial.println(gps.speed.kmph());
+    Serial.print("Altitude: "); Serial.println(gps.altitude.meters());
+  } else {
+    Serial.println("Using demo location (Indore, MP)");
+    Serial.print("Lat: "); Serial.println(currentLat, 6);
+    Serial.print("Lng: "); Serial.println(currentLng, 6);
+  }
+
+  Serial.println("\n=== Time ===");
+  Serial.print("Date: "); Serial.println(getCurrentDate());
+  Serial.print("Time: "); Serial.println(getCurrentTime());
+  Serial.print("ISO Timestamp: "); Serial.println(getISOTimestamp());
+
+  delay(500);
+}
